@@ -1,0 +1,280 @@
+# Use to check code format
+
+name: Build & Tests
+
+# This workflow runs every push and on every PR
+on:
+  push:
+    branches: ["main"]
+  pull_request_review:
+    types: [submitted]
+
+env:
+  MIX_ENV: test
+  # NOTE: make sure these versions match in Containerfile and .tool-versions
+  ELIXIR_VERSION_SPEC: "1.18.4-otp-28"
+  OTP_VERSION_SPEC: "28.0.2"
+
+jobs:
+  check-format:
+    if: github.event.review.state == 'approved'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION_SPEC }}
+          otp-version: ${{ env.OTP_VERSION_SPEC }}
+
+      - name: Installing deps
+        run: mix deps.get
+
+      - name: Checking Mix format
+        run: mix format --check-formatted
+
+  check-for-security-issues:
+    if: github.event.review.state == 'approved'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION_SPEC }}
+          otp-version: ${{ env.OTP_VERSION_SPEC }}
+
+      - name: Install deps
+        run: mix deps.get
+
+      - name: Looking for security issues
+        run: mix sobelow --config
+
+  check-credo:
+    if: github.event.review.state == 'approved'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION_SPEC }}
+          otp-version: ${{ env.OTP_VERSION_SPEC }}
+
+      - name: Install deps
+        run: mix deps.get
+
+      - name: Running credo ...
+        run: mix credo --all
+
+  repository-tests:
+    if: github.event.review.state == 'approved'
+    runs-on: ubuntu-22.04
+    services:
+      # We need postgres for our tests
+      postgres:
+        image: postgres:14.4
+
+        # Match these to what's defined in dev.exs
+        env:
+          POSTGRES_USER: ${{vars.DB_USER_FOR_TEST}}
+          POSTGRES_PASSWORD: ${{vars.DB_USER_PASSWORD_FOR_TEST}}
+          POSTGRES_DB_NAME: ${{vars.DB_NAME_FOR_TEST}}
+          SECRET_KEY_BASE: ${{secrets.SECRET_KEY_BASE}}
+
+        # Maps tcp port 5432 on service container to the host
+        ports: ["5432:5432"]
+
+        # Set health checks to wait until postgres has started
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+
+    env:
+      MIX_ENV: test
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION_SPEC }}
+          otp-version: ${{ env.OTP_VERSION_SPEC }}
+
+      - name: Install deps
+        run: mix deps.get
+
+      - name: Compile deps
+        run: mix compile
+
+      - name: Setup database
+        env:
+          MIX_ENV: test
+          PGHOST: localhost
+          POSTGRES_PORT: 5432
+          POSTGRES_USER: ${{vars.DB_USER_FOR_TEST}}
+          POSTGRES_PASSWORD: ${{vars.DB_USER_PASSWORD_FOR_TEST}}
+          CLOUDINARY_CLOUD_NAME: ${{vars.CLOUDINARY_CLOUD_NAME}}
+          CLOUDINARY_API_KEY: ${{vars.CLOUDINARY_API_KEY}}
+          CLOUDINARY_API_SECRET: ${{vars.CLOUDINARY_API_SECRET}}
+          CLOUDINARY_API_BASE_URL: ${{vars.CLOUDINARY_API_BASE_URL}}
+        run: mix ecto.drop
+          mix ecto.create
+          mix ecto.migrate
+
+      - name: Run Repository Tests
+        env:
+          MIX_ENV: test
+          PGHOST: localhost
+          POSTGRES_PORT: 5432
+          POSTGRES_USER: ${{vars.DB_USER_FOR_TEST}}
+          POSTGRES_PASSWORD: ${{vars.DB_USER_PASSWORD_FOR_TEST}}
+          CLOUDINARY_CLOUD_NAME: ${{vars.CLOUDINARY_CLOUD_NAME}}
+          CLOUDINARY_API_KEY: ${{vars.CLOUDINARY_API_KEY}}
+          CLOUDINARY_API_SECRET: ${{vars.CLOUDINARY_API_SECRET}}
+          CLOUDINARY_API_BASE_URL: ${{vars.CLOUDINARY_API_BASE_URL}}
+        run: mix test test/arlequin_materiaux_website
+
+  integration-tests:
+    if: github.event.review.state == 'approved'
+    runs-on: ubuntu-22.04
+    services:
+      postgres:
+        image: postgres:15.3
+        env:
+          POSTGRES_USER: ${{vars.DB_USER_FOR_TEST}}
+          POSTGRES_PASSWORD: ${{vars.DB_USER_PASSWORD_FOR_TEST}}
+          POSTGRES_DB_NAME: ${{vars.DB_NAME_FOR_TEST}}
+          SECRET_KEY_BASE: ${{secrets.SECRET_KEY_BASE}}
+
+        ports: ["5432:5432"]
+
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+
+    env:
+      MIX_ENV: test
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION_SPEC }}
+          otp-version: ${{ env.OTP_VERSION_SPEC }}
+
+      - name: Cache JS deps
+        id: node-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            assets/node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/assets/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install deps
+        run: mix deps.get
+
+      - name: Compile deps
+        run: mix compile
+
+      - name: Install JS deps (if not cached)
+        if: steps.node-cache.outputs.cache-hit != 'true'
+        run: |
+          cd assets
+          yarn install
+
+      - name: Deploy assets for testing
+        run: mix assets.deploy
+
+      - name: Setup database
+        env:
+          MIX_ENV: test
+          PGHOST: localhost
+          POSTGRES_PORT: 5432
+          POSTGRES_USER: ${{vars.DB_USER_FOR_TEST}}
+          POSTGRES_PASSWORD: ${{vars.DB_USER_PASSWORD_FOR_TEST}}
+          SECRET_KEY_BASE: ${{secrets.SECRET_KEY_BASE}}
+
+        run: mix ecto.drop
+          mix ecto.create
+          mix ecto.migrate
+
+      - name: Run Integration Tests
+        env:
+          MIX_ENV: test
+          PGHOST: localhost
+          POSTGRES_PORT: 5432
+          POSTGRES_USER: ${{vars.DB_USER_FOR_TEST}}
+          POSTGRES_PASSWORD: ${{vars.DB_USER_PASSWORD_FOR_TEST}}
+
+        run: echo -e "\033[42m⏳ Running Controllers Tests ...\033[m"
+          mix test test/arlequin_materiaux_website_web/controllers
+
+          echo -e "\033[42m⏳ Running Live Tests ...\033[m"
+          mix test test/arlequin_materiaux_website_web/live
+
+          echo -e "\033[42m⏳ Running user authentication Tests ...\033[m"
+          mix test test/arlequin_materiaux_website_web/customer_auth_test.exs
+
+  check-code-coverage:
+    if: github.event.review.state == 'approved'
+    runs-on: ubuntu-22.04
+    services:
+      postgres:
+        image: postgres:15.3
+
+        env:
+          POSTGRES_USER: ${{vars.DB_USER_FOR_TEST}}
+          POSTGRES_PASSWORD: ${{vars.DB_USER_PASSWORD_FOR_TEST}}
+          POSTGRES_DB_NAME: ${{vars.DB_NAME_FOR_TEST}}
+
+        ports: ["5432:5432"]
+
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+
+    env:
+      MIX_ENV: test
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION_SPEC }}
+          otp-version: ${{ env.OTP_VERSION_SPEC }}
+
+      - name: Install deps
+        run: mix deps.get
+
+      - name: Compile deps
+        run: mix compile
+
+      - name: Setup database
+        env:
+          MIX_ENV: test
+          PGHOST: localhost
+          POSTGRES_PORT: 5432
+          POSTGRES_USER: ${{vars.DB_USER_FOR_TEST}}
+          POSTGRES_PASSWORD: ${{vars.DB_USER_PASSWORD_FOR_TEST}}
+        run: mix ecto.create
+          mix ecto.migrate
+
+      - name: Run tests coverage
+        env:
+          MIX_ENV: test
+          PGHOST: localhost
+          POSTGRES_PORT: 5432
+          POSTGRES_USER: ${{vars.DB_USER_FOR_TEST}}
+          POSTGRES_PASSWORD: ${{vars.DB_USER_PASSWORD_FOR_TEST}}
+        run: mix coveralls
